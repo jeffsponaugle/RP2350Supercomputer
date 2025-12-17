@@ -1,0 +1,123 @@
+;
+; PIO SPI-like Receiver with CS - ROBUST VERSION for RP2350
+; 
+; Handles lost clock pulses gracefully by polling both CLK and CS
+; rather than using blocking WAIT instructions.
+;
+; If a clock pulse is lost (noise, glitch, etc):
+;   - TX will finish and de-assert CS
+;   - RX will see CS go high during its polling loop
+;   - RX discards partial data and waits for next frame
+;
+; Pin constraint: CS, CLK, DATA must be consecutive GPIOs
+;   base+0: CS
+;   base+1: CLK  
+;   base+2: DATA
+;
+; This uses more instructions than the WAIT version but is robust
+; against single-bit errors on the clock line.
+;
+
+.program spi_rx_cs
+
+; Pin configuration:
+;   JMP_PIN = CS (base+0) - for quick CS checks via jmp pin
+;   IN_BASE = CS (base+0) - so mov osr,pins reads [CS, CLK, DATA, ...]
+;   OUT shift = right, no autopull
+;   IN shift = left, autopush at 8 bits
+;
+; Protocol:
+;   1. Wait for CS low (frame start)
+;   2. Poll for CLK high while checking CS
+;   3. Sample DATA when CLK goes high
+;   4. Poll for CLK low while checking CS  
+;   5. Repeat for each bit
+;   6. When CS goes high, push accumulated bits
+
+.wrap_target
+wait_for_frame:
+    jmp pin wait_for_frame      ; Wait for CS to go low
+    mov isr, null               ; Clear ISR for clean frame reception
+
+poll_clk_high:
+    jmp pin wait_for_frame      ; CS went high? Abort frame, discard partial
+    mov osr, pins               ; Read [CS, CLK, DATA, ...] into OSR
+    out null, 1                 ; Discard CS bit (shift right)
+    out y, 1                    ; Y = CLK bit
+    jmp !y poll_clk_high        ; CLK still low? Keep polling
+    
+    ; CLK is high - sample DATA (still in OSR after the shifts)
+    out y, 1                    ; Y = DATA bit
+    in y, 1                     ; Shift DATA bit into ISR
+
+poll_clk_low:
+    jmp pin frame_done          ; CS went high? Frame complete
+    mov osr, pins               ; Read pins again
+    out null, 1                 ; Discard CS
+    out y, 1                    ; Y = CLK
+    jmp !y poll_clk_high        ; CLK went low? Ready for next bit
+    jmp poll_clk_low            ; CLK still high, keep polling
+
+frame_done:
+    push noblock                ; Push received byte (autopush may have fired)
+.wrap
+
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+/**
+ * Initialize robust SPI RX with CS framing
+ * 
+ * @param pio       PIO instance
+ * @param sm        State machine (0-3)
+ * @param offset    Program offset in PIO memory
+ * @param pin_cs    GPIO for CS input (base pin)
+ * 
+ * Pin layout (MUST be consecutive):
+ *   pin_cs     = CS input (base+0)
+ *   pin_cs + 1 = CLK input (base+1)
+ *   pin_cs + 2 = DATA input (base+2)
+ * 
+ * This version polls both CLK and CS, so lost clock pulses
+ * cause frame abort rather than permanent hang.
+ */
+static inline void spi_rx_cs_program_init(PIO pio, uint sm, uint offset,
+                                           uint pin_cs) {
+    
+    uint pin_clk = pin_cs + 1;
+    uint pin_data = pin_cs + 2;
+    
+    // Configure all three pins as inputs
+    pio_gpio_init(pio, pin_cs);
+    pio_gpio_init(pio, pin_clk);
+    pio_gpio_init(pio, pin_data);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_cs, 3, false);
+    
+    // Get default config
+    pio_sm_config c = spi_rx_cs_program_get_default_config(offset);
+    
+    // JMP pin = CS (for quick CS checks)
+    sm_config_set_jmp_pin(&c, pin_cs);
+    
+    // IN base = CS (so mov osr,pins reads CS at bit 0, CLK at bit 1, DATA at bit 2)
+    sm_config_set_in_pins(&c, pin_cs);
+    
+    // OUT shift: right, no autopull (we use OSR for pin reading, not TX data)
+    sm_config_set_out_shift(&c, true, false, 32);
+    
+    // IN shift: left (MSB first), autopush at 8 bits
+    sm_config_set_in_shift(&c, false, true, 8);
+    
+    // Join FIFOs for deeper RX buffer
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    
+    // Run at full system clock for fastest polling
+    sm_config_set_clkdiv(&c, 1.0f);
+    
+    // Initialize and enable
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+%}

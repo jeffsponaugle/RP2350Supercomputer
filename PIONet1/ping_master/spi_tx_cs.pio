@@ -1,0 +1,110 @@
+;
+; PIO SPI-like Transmitter with Chip Select (Master) for RP2350
+; Generates clock, shifts out data MSB first, frames each byte with CS
+;
+; CS provides:
+;   - Frame synchronization (receiver knows where bytes start/end)
+;   - Recovery from bit slip (CS rising edge resets receiver)
+;
+; Timing designed to work with polling RX:
+;   - CS falling to first CLK rising: 10 TX cycles (setup time)
+;   - CLK LOW duration: 6 TX cycles  
+;   - CLK HIGH duration: 6 TX cycles
+;   - Total: 12 TX cycles per bit
+;
+; At 150 MHz system clock:
+;   clkdiv=1  -> 12.5 MHz bit rate (max safe rate for polling RX)
+;   clkdiv=2  -> 6.25 MHz
+;   clkdiv=10 -> 1.25 MHz
+;
+; Pin requirements: CLK and CS must be adjacent (CLK at base, CS at base+1)
+; DATA can be any GPIO
+;
+
+.program spi_tx_cs
+.side_set 2
+
+; Side-set bits:
+;   bit 0 = CLK
+;   bit 1 = CS (directly active low)
+;
+; Side-set encoding:
+;   0b10 = CS=1 (inactive), CLK=0  - idle state
+;   0b00 = CS=0 (active), CLK=0    - data setup / CLK low phase
+;   0b01 = CS=0 (active), CLK=1    - CLK high phase (sample point)
+
+.wrap_target
+    pull block      side 0b10       ; Wait for data, CS=1 (idle), CLK=0
+    set x, 7        side 0b00 [3]   ; CS=0, CLK=0, 4 cycles setup before first CLK
+bitloop:
+    out pins, 1     side 0b00 [5]   ; Output data bit, CLK=0, 6 cycles low
+    jmp x-- bitloop side 0b01 [5]   ; CLK=1, 6 cycles high, loop for 8 bits
+    ; Falls through after 8th bit with CLK going high
+    nop             side 0b00 [1]   ; Brief CLK=0 before CS rises (clean edge)
+.wrap
+    ; Wrap sets side-set to 0b10 (CS=1), ending the frame
+
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+/**
+ * Initialize SPI TX with CS framing
+ * 
+ * @param pio       PIO instance
+ * @param sm        State machine (0-3)
+ * @param offset    Program offset in PIO memory
+ * @param pin_clk   GPIO for CLK (CS will be pin_clk + 1)
+ * @param pin_data  GPIO for DATA (any pin)
+ * @param freq_hz   Desired bit rate in Hz (max ~12-13 MHz for reliable RX)
+ * 
+ * Pin layout: CLK and CS must be adjacent
+ *   pin_clk     = CLK output
+ *   pin_clk + 1 = CS output (active low)
+ *   pin_data    = DATA output (can be anywhere)
+ * 
+ * Timing per bit: 12 PIO cycles (6 low, 6 high)
+ */
+static inline void spi_tx_cs_program_init(PIO pio, uint sm, uint offset,
+                                           uint pin_clk, uint pin_data, float freq_hz) {
+    
+    uint pin_cs = pin_clk + 1;
+    
+    // Configure DATA pin
+    pio_gpio_init(pio, pin_data);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_data, 1, true);
+    
+    // Configure CLK and CS pins (adjacent pair)
+    pio_gpio_init(pio, pin_clk);
+    pio_gpio_init(pio, pin_cs);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_clk, 2, true);
+    
+    // Get default config
+    pio_sm_config c = spi_tx_cs_program_get_default_config(offset);
+    
+    // OUT pin for data
+    sm_config_set_out_pins(&c, pin_data, 1);
+    
+    // Side-set pins: CLK at base, CS at base+1
+    sm_config_set_sideset_pins(&c, pin_clk);
+    
+    // Shift OSR left (MSB first), no autopull (we use pull block for framing)
+    sm_config_set_out_shift(&c, false, false, 8);
+    
+    // Join FIFOs for deeper TX buffer
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    
+    // Clock divider: 12 PIO cycles per bit
+    float div = clock_get_hz(clk_sys) / (12.0f * freq_hz);
+    if (div < 1.0f) div = 1.0f;  // Clamp to max speed
+    sm_config_set_clkdiv(&c, div);
+    
+    // Set initial pin states: CS high (inactive), CLK low
+    pio_sm_set_pins_with_mask(pio, sm, (1u << pin_cs), (1u << pin_clk) | (1u << pin_cs));
+    
+    // Initialize and enable
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+%}
